@@ -1,0 +1,108 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: account-config
+  namespace: store
+data:
+  SERVICE_NAME: account
+  TOKEN_TTL_SECONDS: "1800"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: account
+  namespace: store
+spec:
+  replicas: 2
+  revisionHistoryLimit: 3
+  strategy:
+    rollingUpdate: {maxUnavailable: 0, maxSurge: 1}
+  selector:
+    matchLabels: {app: account}
+  template:
+    metadata:
+      labels: {app: account}
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8000"
+        prometheus.io/path: /metrics
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        fsGroup: 10001
+      terminationGracePeriodSeconds: 30
+      containers:
+      - name: account
+        image: microserv-store/account:local
+        imagePullPolicy: IfNotPresent
+        ports: [{containerPort: 8000, name: http}]
+        envFrom: [{configMapRef: {name: account-config}}]
+        env:
+        - name: JWT_SECRET
+          valueFrom:
+            secretKeyRef: {name: store-secrets, key: JWT_SECRET}
+        - name: DATABASE_URL
+          valueFrom:
+            secretKeyRef: {name: store-secrets, key: DATABASE_URL}
+        - name: INTERNAL_AUTH_KEY
+          valueFrom:
+            secretKeyRef: {name: store-secrets, key: INTERNAL_AUTH_KEY}
+        resources:
+          requests: {cpu: 100m, memory: 128Mi}
+          limits: {cpu: "1", memory: 256Mi}
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities: {drop: [ALL]}
+        volumeMounts: [{name: tmp, mountPath: /tmp}]
+        startupProbe:
+          httpGet: {path: /health-check, port: http}
+          failureThreshold: 60
+          periodSeconds: 2
+        readinessProbe:
+          httpGet: {path: /ready, port: http}
+          periodSeconds: 5
+        livenessProbe:
+          httpGet: {path: /health-check, port: http}
+          periodSeconds: 10
+      volumes: [{name: tmp, emptyDir: {}}]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: account
+  namespace: store
+spec:
+  type: ClusterIP
+  selector: {app: account}
+  ports: [{port: 8000, targetPort: http, name: http}]
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: account
+  namespace: store
+spec:
+  scaleTargetRef: {apiVersion: apps/v1, kind: Deployment, name: account}
+  minReplicas: 2
+  maxReplicas: 5
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 60
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target: {type: Utilization, averageUtilization: 60}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: account
+  namespace: store
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels: {app: account}
